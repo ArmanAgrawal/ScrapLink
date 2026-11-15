@@ -56,6 +56,8 @@ async def get_match_alerts(
 
     return {"status": "success", "alerts": alerts, "total": len(alerts)}
 
+
+
 @router.post("/{requirement_id}/refresh", response_model=MatchRankResponse)
 async def refresh_matches(
     requirement_id: str,
@@ -68,6 +70,7 @@ async def refresh_matches(
     if not req:
         raise HTTPException(status_code=404, detail="Requirement not found")
 
+    # 2. Fetch candidate listings (Hard Filter: Active only)
     listings = db.query(ScrapListing).filter(
         ScrapListing.availability_status == ListingStatus.ACTIVE
     ).limit(100).all() 
@@ -75,6 +78,7 @@ async def refresh_matches(
     if not listings:
         raise HTTPException(status_code=400, detail="No active listings to match against")
 
+    # 3. Format the requirement text
     req_text = f"Need {req.quantity} {req.unit} of {req.material_name}."
     if req.grade: req_text += f" Grade: {req.grade}."
     if req.description: req_text += f" Details: {req.description}."
@@ -108,7 +112,8 @@ async def refresh_matches(
     )
 
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        # ✅ INCREASED TIMEOUT: 60 seconds to allow Render to wake up
+        async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(
                 ml_url,
                 json=payload.model_dump(exclude_none=True),
@@ -132,10 +137,29 @@ async def refresh_matches(
             
             return result
             
-        raise HTTPException(status_code=502, detail="ML service returned an error")
+        # ✅ Catch ML service errors (422, 500, etc.)
+        print(f"❌ ML Service Error: {response.text}")
+        raise HTTPException(status_code=502, detail=f"ML service error: {response.status_code}")
         
-    except httpx.RequestError:
+    # ✅ Explicitly catch Timeouts FIRST
+    except httpx.TimeoutException:
+        print("❌ ML service timed out. It might be waking up.")
+        raise HTTPException(status_code=504, detail="Matching service timed out. Please try again in 30 seconds.")
+        
+    # ✅ Catch connection errors
+    except httpx.RequestError as e:
+        print(f"❌ Could not connect to ML service: {e}")
         raise HTTPException(status_code=502, detail="Could not reach matching service")
+        
+    # ✅ Safely pass HTTPExceptions up to FastAPI
+    except HTTPException:
+        raise
+        
+    # ✅ Catch any other unexpected bugs
+    except Exception as e:
+        print(f"❌ Unexpected error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error during matching")
+
 
 @router.get("/{requirement_id}", response_model=MatchRankResponse)
 async def get_matches(
